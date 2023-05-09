@@ -130,7 +130,7 @@ class MriActivityBase(Dataset):
                 self.data[key] = new_list
         
         self.data["relative_file_path_"], self.data["file_path_"] = self.getNamefor(self)
-
+        self._length = len(self.data["relative_file_path_"])
         # shuffle
         #combined = list(zip(self.data["file_path_"] , self.data["relative_file_path_"]))
         #random.seed(1234)
@@ -144,7 +144,7 @@ class MriActivityBase(Dataset):
         # Eliminate start and end fixation cross in each run
         
     def __len__(self):
-        return len(self.data["relative_file_path_"])
+        return self._length
     
     def getNamefor(self, data):
         start = 0
@@ -189,10 +189,13 @@ class MriActivityBase(Dataset):
     
     def __getitem__(self, i):    
         #image = {key : cv2.resize(np.load(key,allow_pickle=True),(512,512)) for key in self.data["file_path_"][i]}  
-        image = {key : np.load(key,allow_pickle=True) for key in self.data["relative_file_path_"][i]}  
-        stimulus = cv2.imread(self.data["file_path_"][i])
+        image = {key : np.load(key,allow_pickle=True) for key in self.data["relative_file_path_"][i]}
+	path_label = self.data["file_path_"][i]  
+        stimulus = cv2.imread(path_label)
         stimulus = convert_rgb(stimulus)
         stimulus = resize_image(stimulus,self.img_dim)
+        stimulus = (stimulus / 127.5 - 1.0).astype(np.float32)
+
         example = {
             "image" : stimulus,
             "activity" : np.array(list(image.values())).transpose(1,2,0),
