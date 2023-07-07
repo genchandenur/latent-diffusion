@@ -188,8 +188,7 @@ class MriActivityBase(Dataset):
         return new_dict
     
     def __getitem__(self, i):    
-        #image = {key : cv2.resize(np.load(key,allow_pickle=True),(512,512)) for key in self.data["file_path_"][i]}  
-        image = {key : np.load(key,allow_pickle=True) for key in self.data["relative_file_path_"][i]}
+        image = {key : resize_image(np.load(key,allow_pickle=True),self.img_dim) for key in self.data["relative_file_path_"][i]}
         path_label = self.data["file_path_"][i] 
         stimulus = cv2.imread(path_label)
         stimulus = convert_rgb(stimulus)
