@@ -1,0 +1,99 @@
+model:
+  base_learning_rate: 1.0e-06 #5.0e-5  set to target_lr by starting main.py with '--scale_lr False'
+  target: ldm.models.diffusion.ddpm.LatentDiffusion
+  params:
+    linear_start: 0.0015
+    linear_end: 0.0205 
+    num_timesteps_cond: 1
+    log_every_t: 200
+    timesteps: 1000
+    loss_type: l1
+    first_stage_key: image
+    cond_stage_key: activity
+    image_size: 64
+    channels: 3
+    monitor: val/loss_simple_ema
+    cond_stage_trainable: True
+    concat_mode: False
+    scale_by_std: False
+
+    scheduler_config: # 10000 warmup steps
+      target: ldm.lr_scheduler.LambdaLinearScheduler
+      params:
+        warm_up_steps: [10000]
+        cycle_lengths: [10000000000000]
+        f_start: [1.e-6]
+        f_max: [1.]
+        f_min: [ 1.]
+
+    unet_config:
+      target: ldm.modules.diffusionmodules.openaimodel.UNetModel
+      params:
+        image_size: 64
+        in_channels: 3
+        out_channels: 3
+        model_channels: 128
+        attention_resolutions: [ 8, 4, 2 ] #[ 32, 16, 8, 4 ] # 1, 2, 4, 8 
+        num_res_blocks: 2
+        channel_mult: [1, 2, 4, 4]  # 32, 16, 8, 4, 2
+        num_heads: 8
+
+    first_stage_config:
+      target: ldm.models.autoencoder.VQModelInterface
+      params:
+        embed_dim: 3
+        n_embed: 8192
+        ckpt_path: /media/handeg/Expansion/latent-diffusion/ldm-checkpoints/2023-06-01T20-23-57_actvqmodel/checkpoints/last.ckpt
+        ddconfig:
+          double_z: False
+          z_channels: 3
+          resolution: 256
+          in_channels: 3
+          out_ch: 3
+          ch: 128 
+          ch_mult: [ 1,2,4 ]  # num_down = len(ch_mult)-1
+          num_res_blocks: 2
+          attn_resolutions: [ ]
+          dropout: 0.0
+        lossconfig:
+          target: torch.nn.Identity
+    cond_stage_config:
+      target: ldm.modules.encoders.modules.SpatialRescaler
+      params:
+        n_stages: 2
+        in_channels: 5
+        out_channels: 3 
+
+data:
+  target: main.DataModuleFromConfig
+  params:
+    batch_size: 1
+    num_workers: 5
+    wrap: True
+    train:
+      target: ldm.data.fmriactivity.activityTrain
+      params:
+        size: 256
+    validation:
+      target: ldm.data.fmriactivity.activityValidation
+      params:
+        size: 256
+    test:
+      target: ldm.data.fmriactivity.activityTest
+      params:
+        size: 256
+
+lightning:
+  callbacks:
+    image_logger:
+      target: main.ImageLogger
+      params:
+        batch_frequency: 5000
+        max_images: 4
+        increase_log_steps: False
+
+
+  trainer:
+    benchmark: True
+    #accumulate_grad_batches: 4
+    #gpus: 1,2
