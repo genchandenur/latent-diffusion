@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from taming.modules.vqvae.quantize import VectorQuantizer2 as VectorQuantizer
 
 from ldm.modules.diffusionmodules.model import Encoder, Decoder
+from ldm.modules.encoders.modules import Resnet3D
 from ldm.modules.distributions.distributions import DiagonalGaussianDistribution
 
 from ldm.util import instantiate_from_config
@@ -703,6 +704,205 @@ class VQModel2(pl.LightningModule):
         return x
 
 class VQModelInterface2(VQModel2):
+    def __init__(self, embed_dim, *args, **kwargs):
+        super().__init__(embed_dim=embed_dim, *args, **kwargs)
+        self.embed_dim = embed_dim
+
+    def encode(self, x):
+        h = self.encoder(x)
+        h = self.quant_conv(h)
+        return h
+
+    def decode(self, h, force_not_quantize=False):
+        # also go through quantization layer
+        if not force_not_quantize:
+            quant, emb_loss, info = self.quantize(h)
+        else:
+            quant = h
+        quant = self.post_quant_conv(quant)
+        dec = self.decoder(quant)
+        return dec
+
+
+class VQModel3D(VQModel):
+    def __init__(self,
+                 ddconfig,
+                 lossconfig,
+                 #rescalingconfig,
+                 n_embed,
+                 embed_dim,
+                 ckpt_path=None,
+                 ignore_keys=[],
+                 image_key="activity",
+                 colorize_nlabels=None,
+                 monitor=None,
+                 batch_resize_range=None,
+                 scheduler_config=None,
+                 lr_g_factor=1.0,
+                 remap=None,
+                 sane_index_shape=False, # tell vector quantizer to return indices as bhw
+                 use_ema=False
+                 ):
+        super().__init__(ddconfig=ddconfig,lossconfig=lossconfig, embed_dim = embed_dim, n_embed = n_embed)
+        self.embed_dim = embed_dim
+        self.n_embed = n_embed
+        self.image_key = image_key
+        self.encoder = Resnet3D(model_depth=101, n_input_channels=5)
+        self.decoder = Decoder(**ddconfig)
+        self.loss = instantiate_from_config(lossconfig)
+        
+        self.quantize = VectorQuantizer(n_embed, embed_dim, beta=0.25,
+                                        remap=remap,
+                                        sane_index_shape=sane_index_shape)
+        self.quant_conv = torch.nn.Conv2d(ddconfig["z_channels"], embed_dim, 1)
+        self.post_quant_conv = torch.nn.Conv2d(embed_dim, ddconfig["z_channels"], 1)
+        
+        if colorize_nlabels is not None:
+            assert type(colorize_nlabels)==int
+            self.register_buffer("colorize", torch.randn(3, colorize_nlabels, 1, 1))
+        if monitor is not None:
+            self.monitor = monitor
+        self.batch_resize_range = batch_resize_range
+        if self.batch_resize_range is not None:
+            print(f"{self.__class__.__name__}: Using per-batch resizing in range {batch_resize_range}.")
+
+        self.use_ema = use_ema
+        if self.use_ema:
+            self.model_ema = LitEma(self)
+            print(f"Keeping EMAs of {len(list(self.model_ema.buffers()))}.")
+            
+        if ckpt_path is not None:
+            self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
+        self.scheduler_config = scheduler_config
+        self.lr_g_factor = lr_g_factor
+ 
+    def init_from_ckpt(self, ckpt_path, ignore_keys=[]):
+        sd = torch.load(ckpt_path, map_location="cpu")["state_dict"]
+        # Filter out encoder keys
+        decoder_sd = {k.replace('decoder.', ''): v for k, v in sd.items() if k.startswith('decoder.')}
+        decoder_sds = {k: v for k, v in sd.items() if k.startswith('decoder.')}
+        # Load decoder weights into the current model
+        self.decoder.load_state_dict(decoder_sd)
+        print(f"Loaded weights from {ckpt_path}")
+        
+        missing, unexpected = self.load_state_dict(decoder_sds, strict=False)
+        print(f"Restored from {ckpt_path} with {len(missing)} missing and {len(unexpected)} unexpected keys")
+        if len(missing) > 0:
+            print(f"Missing keys: {missing}")
+        if len(unexpected) > 0:
+            print(f"Unexpected keys: {unexpected}")
+
+    def get_input(self, batch, k):
+        x = batch[k]
+        y = batch["image"]
+        if len(x.shape) == 4:
+            x = x[..., None]
+            y= y[..., None]
+        x = x.permute(0, 4, 1, 2, 3).to(memory_format=torch.contiguous_format).float()
+        y = y.permute(0, 3, 1, 2).to(memory_format=torch.contiguous_format).float()
+
+        if self.batch_resize_range is not None:
+            lower_size = self.batch_resize_range[0]
+            upper_size = self.batch_resize_range[1]
+            if self.global_step <= 4:
+                # do the first few batches with max size to avoid later oom
+                new_resize = upper_size
+            else:
+                new_resize = np.random.choice(np.arange(lower_size, upper_size+16, 16))
+            if new_resize != x.shape[2]:
+                x = F.interpolate(x, size=new_resize, mode="bicubic")
+                
+            x = x.detach()
+            y = y.detach() 
+        return x,y
+    
+    def training_step(self, batch, batch_idx, optimizer_idx):
+        # https://github.com/pytorch/pytorch/issues/37142
+        # try not to fool the heuristics
+        x,y = self.get_input(batch, self.image_key)
+        xrec, qloss = self(x, return_pred_indices=False)
+
+        if optimizer_idx == 0:
+            # autoencode
+            aeloss, log_dict_ae = self.loss(qloss, y, xrec, optimizer_idx, self.global_step,
+                                            last_layer=self.get_last_layer(), split="train",
+                                            )
+            
+            self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=True)
+            return aeloss
+
+        if optimizer_idx == 1:
+            # discriminator
+            discloss, log_dict_disc = self.loss(qloss, y, xrec, optimizer_idx, self.global_step,
+                                            last_layer=self.get_last_layer(), split="train")
+            self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=True)
+            return discloss
+
+    def validation_step(self, batch, batch_idx):
+        log_dict = self._validation_step(batch, batch_idx)
+        with self.ema_scope():
+            log_dict_ema = self._validation_step(batch, batch_idx, suffix="_ema")
+        return log_dict
+
+    def _validation_step(self, batch, batch_idx, suffix=""):
+        x,y = self.get_input(batch, self.image_key)
+        xrec, qloss = self(x, return_pred_indices=False)
+        aeloss, log_dict_ae = self.loss(qloss, y, xrec, 0,
+                                        self.global_step,
+                                        last_layer=self.get_last_layer(),
+                                        split="val"+suffix
+                                        )
+
+        discloss, log_dict_disc = self.loss(qloss, y, xrec, 1,
+                                            self.global_step,
+                                            last_layer=self.get_last_layer(),
+                                            split="val"+suffix
+                                            )
+        rec_loss = log_dict_ae[f"val{suffix}/rec_loss"]
+        self.log(f"val{suffix}/rec_loss", rec_loss,
+                   prog_bar=True, logger=True, on_step=False, on_epoch=True, sync_dist=True)
+        self.log(f"val{suffix}/aeloss", aeloss,
+                   prog_bar=True, logger=True, on_step=False, on_epoch=True, sync_dist=True)
+
+        del log_dict_ae[f"val{suffix}/rec_loss"]
+        self.log_dict(log_dict_ae)
+        self.log_dict(log_dict_disc)
+        return self.log_dict
+            
+    def forward(self, input, return_pred_indices=False):
+        quant, diff, (_,_,ind) = self.encode(input)
+        dec = self.decode(quant)
+        if return_pred_indices:
+            return dec, diff, ind
+        return dec, diff
+    
+    def log_images(self, batch, only_inputs=False, plot_ema=False, **kwargs):
+        log = dict()
+        x,y = self.get_input(batch, self.image_key)
+        x = x.to(self.device)
+        y = y.to(self.device)
+
+        if only_inputs:
+            log["inputs"] = x
+            return log
+        xrec, _ = self(x)
+        #if x.shape[1] > 3:
+            # colorize with random projection
+            #assert xrec.shape[1] > 3
+            #x = self.to_rgb(x)
+            #xrec = self.to_rgb(xrec)
+        #log["inputs"] = x
+        log["reconstructions"] = xrec
+        log["presented_image"] = y
+        if plot_ema:
+            with self.ema_scope():
+                xrec_ema, _ = self(x)
+                if x.shape[1] > 3: xrec_ema = self.to_rgb(xrec_ema)
+                log["reconstructions_ema"] = xrec_ema
+        return log
+    
+        
+class VQModel3DInterface(VQModel3D):
     def __init__(self, embed_dim, *args, **kwargs):
         super().__init__(embed_dim=embed_dim, *args, **kwargs)
         self.embed_dim = embed_dim
